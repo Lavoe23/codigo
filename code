@@ -1,0 +1,146 @@
+#lang racket
+
+(require html-parsing net/url sxml)
+
+; ---- HTML -> SXML
+(define page-get (lambda (url)
+  (html->xexp
+    (call/input-url (string->url url)
+                    (curry get-pure-port #:redirections 2)
+                    port->string))))
+
+(define rae-url (lambda (palabra)
+  (string-append "https://dle.rae.es/" palabra)))
+
+; ---- PROCESAR TEXTO: "hola, como estas" -> '("hola" "," "como" "estas") ;
+(define text-to-list
+  (lambda (str)
+    (string-split
+      (regexp-replace* #px"[.,;:¿?¡!-']"
+      str
+      (lambda (match)
+        (string-append " " match " "))))))
+
+(define sample
+  (text-to-list
+    "Benjamín pidió una bebida de kiwi y fresa. Noé, sin vergüenza, la más exquisita champaña del menú."))
+
+; ---- Crear lista con urls
+; '("hola" "," "como" "estas") -> '("https://dle.rae.es/hola" "https://dle.rae.es/como" ...)
+(define rae-buscador (lambda (L)
+  (cond
+    [(null? L) '()]
+    [(> (string-length (car L)) 1) (cons (rae-url (car L)) (rae-buscador (cdr L)))]
+    [else
+      (rae-buscador (cdr L))])))
+
+; ---- Funcion para filtrar strings basura en una lista
+(define useless-chars
+  (lambda (str)
+    (cond
+      #| [(= ( string-length str ) 1 ) #f] |#
+      [(regexp-match-exact? #rx"[0-9]+" str) #f]
+      [(string=? str ", ") #f]
+      [(string=? str ": ") #f]
+      [(string=? str " ") #f]
+      [(string=? str ".") #f]
+      [(string=? str ". ") #f]
+      [(string=? str " (‖ ") #f]
+      [(string=? str ").") #f])))
+
+(define (juntar-str lst sep)
+  (cond
+    [(null? lst) ""]
+    [(null? (cdr lst)) (car lst)]
+    [else (string-append (car lst) sep (juntar-str (cdr lst) sep))]))
+
+; ---- Recibe una lista de lista con strings y las limpia usando filter
+; '((" "  " " " "."  "Hijo" "menor" "de" "una" "familia"...)) -> '(("Hijo" "menor" "de" "una" "familia"... ))
+; Ej: (clean-list (list ((sxpath "//p[contains(@class, 'j')]//text()") html-doc)))
+(define clean-list (lambda (lst)
+  (cond
+    [(null? lst) '()]
+    [(pair? (car lst)) (cons (filter useless-chars (car lst)) (clean-list (cdr lst)))]
+    (else (clean-list (cdr lst))))))
+
+; ---- Trabajando SXML
+(define crear-doc-html (lambda (palabra)
+  (page-get (rae-url palabra))))
+
+; ---- Filtramos el contenido util, todas las etiquetas <p class="j"> </p?
+(define html-info-palabra (lambda (sxml)
+  ((sxpath "//p[contains(@class, 'j')]") sxml)))
+
+; ---- De aqui sale el titulo de la palabra de la rae
+(define get-word-title (lambda (sxml)
+  (car ((sxpath "//header//text()") sxml))))
+
+; ---- Aqui se genera la descripcion de la palabra
+; Ej: 1. m. y f. Hijo menor de una familia. -> '("nombre masculino y femenino" "Hijo menor de una familia")
+; (get-desc (html-info-palabra sxml))
+(define get-desc (lambda (sxml)
+  (cons
+    (car ((sxpath "//abbr/@title//text()") sxml)) ; -- tipo de palabra
+    (list (juntar-str ; -- descripcion/significado de palabra
+      (list-tail (car (clean-list (list ((sxpath "/span//text()") sxml)))) 1)
+      " ")))))
+
+; ---- Si es que la palabra tiene sinonimos o antominos, se guardan aqui
+; Ej:  Sin.:menor, pequeño, xocoyote, socoyote, tierno, cumiche. -> '("Sin.: menor pequeño xocoyote socoyote tierno cumiche Ant.: primogénito mayor")
+; (get-sin-ant (html-info-palabra sxml))
+(define get-sin-ant (lambda (sxml)
+  (cond
+    ((null? ((sxpath "//table//text()") sxml)) '()) ; retorna lista vacia si no tiene sinonimos o antonimos
+    (else
+      (list (juntar-str
+        (car (clean-list (list ((sxpath "//table//text()") sxml))))
+        " "))))))
+
+; ---- Junta la descripcion y sinonimos o antonimos en una lista
+; '("verbo transitivo" "Expresar a alguien la necesidad o el deseo de algo para que lo satisfaga")
+; +
+; '("Sin.: solicitar demandar requerir rogar suplicar implorar postular pretender Ant.: dar conceder negar")
+; --> '("verbo transitivo" "Expresar a alguien la necesidad o el deseo de algo para que lo satisfaga" "Sin.: solicitar demandar requerir rogar suplicar implorar pos
+; tular  info-totalnt.: dar conceder negar")
+(define info-por-parte (lambda (sxml)
+  (append (get-desc sxml) (get-sin-ant sxml))))
+
+; ---- Aplica la function info-por-parte a todas las definiciones posibles de alguna palabra y las junta en una sola lista
+(define info-total (lambda (sxml)
+  (map info-por-parte (html-info-palabra sxml))))
+
+; ---- Compilamos todas las listas anteriores en una sola por cada palabra
+; `(palabra "palabra" ("def ... sin ... ant ...") ("def ...") ...)
+(define analizar (lambda (str)
+  (define html-doc (crear-doc-html str))
+  (define sub-pagina ((sxpath "//div[contains(@class, 'n1')]//text()") (crear-doc-html str)))
+  (cond
+    [(and (null? (html-info-palabra html-doc)) (null? sub-pagina)) '()]
+    [(null?
+      (html-info-palabra html-doc))
+      (analizar (car sub-pagina))]
+    (else
+      (cons
+          (string->symbol str)
+          (cons
+            (get-word-title html-doc)
+            (info-total html-doc)))))))
+
+; "Benjamín pidió una bebida de kiwi y fresa. Noé, sin vergüenza, la más exquisita champaña del menú." ~16 a buscar
+
+(map analizar sample) ; ---- aplica full-info a todas las palabras del texto y retorna una lista de listas
+; `((palabra1 "palabra" ("def ... sin ... ant ...")) (palabra2 "palabra" ("def ... sin ... ant ...")))
+
+(define process-user-input
+  (lambda (user-text)
+    (map analizar (text-to-list user-text))))
+
+(define main
+  (lambda ()
+    (print "Ingrese el texto a analizar:")
+    (define user-text (read-line))
+    (define results (process-user-input user-text))
+    (print "Resultados:")
+    (for-each print results)))
+
+(main)
